@@ -1,6 +1,6 @@
 # F1 Betting Backend
 
-A Formula 1 betting REST API built with **Spring Boot 3**, **H2 In-Memory Database** (zero setup, plug-and-play), and the live **OpenF1 public API** (featuring client-side rate limiting, multi-tiered caching, and resilient mock fallback).
+A Formula 1 betting REST API built with **Spring Boot 3**, **H2 In-Memory Database** (zero setup, plug-and-play), and the live **OpenF1 public API** (featuring client-side rate limiting, bounded LRU caching, resilient mock fallback, and bulletproof transactional concurrency control).
 
 ---
 
@@ -15,6 +15,7 @@ A Formula 1 betting REST API built with **Spring Boot 3**, **H2 In-Memory Databa
 ┌───────────────────────────────────▼────────────────────────────────────┐
 │                            Service Layer                               │
 │      EventService     BettingService    OutcomeService    UserService  │
+│                      (SessionLockManager & TransactionTemplate)        │
 └─────────────┬───────────────────────────────────────────┬──────────────┘
               │                                           │
 ┌─────────────▼──────────────────────────┐  ┌─────────────▼──────────────┐
@@ -23,13 +24,15 @@ A Formula 1 betting REST API built with **Spring Boot 3**, **H2 In-Memory Databa
 │  ┌─ OpenF1EventProvider (@Primary)     │  │                            │
 │  │  ├─ OpenF1Client (RestTemplate)     │  │  UserRepository           │
 │  │  ├─ OpenF1RateLimiter               │  │  BetRepository            │
-│  │  │  (Token bucket, 3 req/s throttle,│  │  EventOutcomeRepository   │
-│  │  │   25 req/m cap, 429 backoff)     │  │                            │
-│  │  └─ In-Memory TTL Caching           │  │  Web Console:              │
-│  │     (Sessions, Drivers, Negative)   │  │   /h2-console              │
+│  │  │  (Resilience4j Token Bucket &    │  │  EventOutcomeRepository   │
+│  │  │   CircuitBreaker with Success/   │  │   (Unique constraint on    │
+│  │  │   Failure Tracking, 429 backoff) │  │    session_key)            │
+│  │  └─ Bounded LRU & TTL Caching       │  │                            │
+│  │     (Auto-eviction, max capacity,   │  │  Web Console:              │
+│  │      negative cache for 404s)       │  │   /h2-console              │
 │  │                                     │  └────────────────────────────┘
 │  └─ MockF1EventProvider (Fallback)     │
-│        (Official historical sessions & │
+│        (Authentic historical sessions &│
 │         grid when offline/rate-limited)│
 └──────────────────┬─────────────────────┘
                    ↕ HTTP
@@ -40,10 +43,14 @@ A Formula 1 betting REST API built with **Spring Boot 3**, **H2 In-Memory Databa
 
 1. **Provider Abstraction**: All business services depend on the `F1EventProvider` interface rather than directly on OpenF1. Swapping to a commercial data provider or custom feed requires only a new interface implementation with zero changes to services or controllers.
 2. **Zero-Setup Embedded Database**: Uses an embedded H2 in-memory database with automatic Hibernate schema initialization (`create-drop`). No external database installation, DBA grants, or connection pool setup is required to run the application or tests.
-3. **Proactive Rate Limiting & 429 Prevention**: The OpenF1 free tier enforces strict rate limits (3 req/s burst, ~30 req/min sustained). The built-in `OpenF1RateLimiter` enforces inter-request throttling, sliding-window quotas, and automatic backoff honoring `Retry-After` headers.
-4. **Multi-Tier In-Memory Caching**: Responses for sessions and driver rosters are cached with configurable TTLs. Missing telemetry or cancelled events trigger negative caching to prevent redundant failing calls.
-5. **Resilient Offline Fallback**: If OpenF1 is unreachable, DNS-blocked, or rate-limited, the system transparently falls back to `MockF1EventProvider` containing authentic historical sessions (Monza 2023, Monaco 2024, Silverstone 2024, Sakhir 2024) and the official 2024 driver grid.
-6. **Observability & Diagnostics**: Integrated Spring Boot Actuator (`/actuator/health`) and interactive H2 Web Console (`/h2-console`) for real-time inspection.
+3. **Decoupled External I/O & Thread Pool Isolation**: External driver validation is performed **before and outside** the database transaction using a dedicated bounded executor pool (`f1ValidationExecutor`), preventing Hikari connection starvation and JVM `ForkJoinPool.commonPool()` exhaustion. External calls are cancelled immediately on timeout.
+4. **Race-Free Concurrency Control (`SessionLockManager`)**: Fine-grained per-session locking eliminates TOCTOU races between concurrent `placeBet` and `recordOutcome` calls. `placeBet` re-checks outcome presence inside the locked transaction; `recordOutcome` prevents concurrent duplicate settlements and translates database integrity violations into clean error responses.
+5. **Proactive Rate Limiting & Circuit Breaker**: The public OpenF1 API imposes strict limits (3 req/s burst, ~30 req/min). `OpenF1RateLimiter` pairs a Resilience4j rate limiter with a sliding-window circuit breaker tracking both successes and failures, burst throttling (>= 350ms delay), and dynamic 429 backoff honoring `Retry-After` headers.
+6. **Bounded LRU Caching & Memory Protection**: Session and driver caches use thread-safe bounded LRU collections with automatic capacity eviction and TTL expiration, neutralizing memory-exhaustion vectors from arbitrary session keys.
+7. **Cancelled Event Filtering**: OpenF1 sessions flagged with `is_cancelled: true` (e.g. Imola 2023) are automatically filtered out from active event listings.
+8. **Winner Driver Validation**: Declared race winners in `OutcomeService` are verified against the official driver roster for that session before any bets are settled.
+9. **Secure Exception Handling**: `GlobalExceptionHandler` masks internal server errors to prevent information disclosure while cleanly handling database constraint conflicts, malformed JSON, and path variable type mismatches.
+10. **Observability & Diagnostics**: Spring Boot Actuator (`/actuator/health`) and interactive H2 Web Console (`/h2-console`) for real-time inspection.
 
 ---
 
@@ -99,7 +106,7 @@ spring.h2.console.path=/h2-console
 # JPA / Hibernate
 spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
 spring.jpa.hibernate.ddl-auto=create-drop
-spring.jpa.show-sql=true
+spring.jpa.show-sql=false
 spring.jpa.properties.hibernate.format_sql=true
 spring.jpa.open-in-view=false
 
@@ -119,31 +126,48 @@ openf1.api.read-timeout-ms=25000
 openf1.rate-limit.requests-per-second=3
 openf1.rate-limit.requests-per-minute=25
 openf1.rate-limit.cooldown-seconds=60
+openf1.rate-limit.failure-cooldown-seconds=20
 
 # OpenF1 In-Memory Caching (TTLs in minutes)
 openf1.cache.session-ttl-minutes=15
 openf1.cache.driver-ttl-minutes=60
 openf1.cache.negative-ttl-minutes=15
+
+# Event listing optimization threshold
+events.bulk-listing-threshold=20
+
+# Betting validation timeout in seconds for external driver check
+betting.driver-validation-timeout-seconds=8
 ```
 
 ---
 
-## Rate Limiting, Caching & Resilience
+## Concurrency, Rate Limiting & Resilience
 
-### OpenF1 Rate Limiting (`OpenF1RateLimiter`)
-The public OpenF1 API imposes a limit of **3 requests/second burst** and **~30 requests/minute**. To maintain compliance and prevent HTTP 429 errors:
-- **Inter-Request Throttling**: Automatically spaces outbound requests by at least ~368ms, keeping burst rates safely under 3 req/s.
-- **Sliding Window Cap**: Proactively tracks request timestamps over a 60-second window, capping calls at 25 requests/minute (preserving a safety margin).
-- **HTTP 429 Cooldown**: If an upstream 429 is encountered, the rate limiter parses the `Retry-After` header (or defaults to a 60-second cooldown) and suspends outbound requests until the cooldown elapses.
+### Concurrency & Transaction Management
+- **`SessionLockManager`**: Provides exclusive, non-blocking lock striping per `sessionKey`. Bet placements and outcome settlements on the same session are serialized, preventing any bet from being accepted while an outcome is being recorded.
+- **Transaction Scope**: `placeBet` and `recordOutcome` perform external validation calls completely outside the DB transaction. A `TransactionTemplate` wraps only the actual database mutations (balance debit, bet persistence, winner settlement).
+- **Pessimistic Locking**: `userRepository.findByIdForUpdate()` ensures user balances cannot be overdrawn under concurrent requests.
 
-### In-Memory Caching & Negative Caching
-- **Sessions Cache**: Cached for **15 minutes** by query criteria (`sessionType`, `year`, `country`).
-- **Drivers Cache**: Cached for **60 minutes** per `sessionKey`.
-- **Negative Caching**: Sessions with no recorded drivers or cancelled telemetry (e.g. Imola 2023) are cached with fallback data for **15 minutes** to prevent continuous retries.
-- **Baseline Grid Pre-Warming**: Lazily warms up the latest F1 grid via `/drivers?session_key=latest` for fast driver lookups.
+### OpenF1 Rate Limiting & Circuit Breaker (`OpenF1RateLimiter`)
+- **Inter-Request Throttling**: Spaces outbound requests by at least ~368ms, keeping burst rates safely under 3 req/s.
+- **Sliding Window Cap**: Limits calls to 25 requests/minute over a 60-second rolling window.
+- **Circuit Breaker Tracking**: Outbound successes record elapsed time via `recordSuccess()`, while timeouts and network errors trip `recordFailure()`, allowing Resilience4j to compute accurate error rates and recover automatically.
+- **HTTP 429 Cooldown**: Parses upstream `Retry-After` headers (defaulting to 60s) and suspends outbound requests during active backoff.
+
+### Bounded In-Memory Caching & Eviction
+- **Sessions Cache**: Bounded LRU cache (max 200 entries, 15-minute TTL).
+- **Drivers Cache**: Bounded LRU cache (max 500 entries, 60-minute TTL).
+- **Memory Protection**: Automatically evicts eldest or expired entries on insertion, neutralizing memory-exhaustion attacks.
+- **Negative Caching**: Sessions with no recorded drivers or cancelled telemetry are cached for 15 minutes to prevent hammering OpenF1.
 
 ### Mock Fallback (`MockF1EventProvider`)
-When OpenF1 rate limits are active, the API is unreachable, or an error occurs, the provider seamlessly serves data from `MockF1EventProvider`, ensuring the application remains fully functional for betting and outcome settlement.
+When OpenF1 rate limits are active, the API is unreachable, or an error occurs, the provider seamlessly serves authentic historical sessions with authentic session keys:
+- **Monza 2023 Race**: session key `9157`
+- **Monaco 2024 Race**: session key `9523`
+- **Silverstone 2024 Race**: session key `9558`
+- **Bahrain 2024 Race**: session key `9472`
+*(Backward-compatible aliases `9161`, `9520`, and `9540` are also recognized).*
 
 ---
 
@@ -154,7 +178,7 @@ When OpenF1 rate limits are active, the API is unreachable, or an error occurs, 
 # Clone / navigate to project root
 cd f1-betting-app
 
-# Run all unit and integration tests (13 tests)
+# Run all unit and integration tests (48 tests)
 mvn test
 ```
 
@@ -212,7 +236,7 @@ http://localhost:8080/api/v1
 
 ### 1. List F1 Events
 
-Fetches sessions from OpenF1 (or fallback) and attaches a driver market with random odds (2, 3, or 4) to each driver.
+Fetches sessions from OpenF1 (or fallback), filters out cancelled sessions, and attaches a driver market with odds (2, 3, or 4) to each driver.
 
 ```http
 GET /api/v1/events
@@ -245,7 +269,7 @@ curl "http://localhost:8080/api/v1/events?sessionType=Race&year=2024&country=Mon
 ```json
 [
   {
-    "sessionKey": "9161",
+    "sessionKey": "9157",
     "sessionName": "Race",
     "sessionType": "Race",
     "year": 2023,
@@ -274,13 +298,11 @@ curl "http://localhost:8080/api/v1/events?sessionType=Race&year=2024&country=Mon
 ]
 ```
 
-> **Note**: Displayed odds in `/events` are randomly generated (2, 3, or 4). When a bet is placed, an odds value is locked in and stored permanently with that bet.
-
 ---
 
 ### 2. Place a Bet
 
-Places a bet on a driver to WIN the specified session. The stake is deducted from the user's balance immediately.
+Places a bet on a driver to WIN the specified session. The driver is validated against the official session roster, and the stake is deducted from the user's balance atomically.
 
 ```http
 POST /api/v1/bets
@@ -291,7 +313,7 @@ Content-Type: application/json
 ```json
 {
   "userId": 1,
-  "sessionKey": "9161",
+  "sessionKey": "9157",
   "driverNumber": 1,
   "stakeAmount": 20.00
 }
@@ -301,7 +323,7 @@ Content-Type: application/json
 |-------|------|----------|-------------|
 | `userId` | Long | ✅ | ID of the user placing the bet |
 | `sessionKey` | String | ✅ | Session key from `GET /api/v1/events` |
-| `driverNumber` | Integer | ✅ | Car number of the backed driver |
+| `driverNumber` | Integer | ✅ | Car number of the backed driver (must be registered in session) |
 | `stakeAmount` | BigDecimal | ✅ | Stake amount in EUR (min: 0.01) |
 
 **Response (201 Created):**
@@ -310,7 +332,7 @@ Content-Type: application/json
   "id": 1,
   "userId": 1,
   "username": "alice",
-  "sessionKey": "9161",
+  "sessionKey": "9157",
   "driverNumber": 1,
   "odds": 3,
   "stakeAmount": 20.00,
@@ -322,7 +344,7 @@ Content-Type: application/json
 ```
 
 **Validation & Error Responses:**
-- `400 Bad Request`: Validation failure (missing fields, stake <= 0).
+- `400 Bad Request`: Validation failure (missing fields, non-positive stake, malformed JSON).
 - `404 Not Found`: User does not exist.
 - `422 Unprocessable Entity`: 
   - User has insufficient balance.
@@ -333,7 +355,7 @@ Content-Type: application/json
 
 ### 3. Record Event Outcome & Settle Bets
 
-Records the winner of an event and automatically settles all pending bets. Winners are credited with `stakeAmount × odds`.
+Records the winner of an event and automatically settles all pending bets. Declared winner is validated against the session roster. Winners receive `stakeAmount × odds` credited to their balance.
 
 ```http
 POST /api/v1/events/{sessionKey}/outcome
@@ -350,7 +372,7 @@ Content-Type: application/json
 **Response (200 OK):**
 ```json
 {
-  "sessionKey": "9161",
+  "sessionKey": "9157",
   "winnerDriverNumber": 1,
   "totalBetsSettled": 2,
   "betsWon": 1,
@@ -378,7 +400,10 @@ Content-Type: application/json
 ```
 
 **Error Responses:**
-- `422 Unprocessable Entity`: Outcome has already been recorded for this session (idempotency protection).
+- `400 Bad Request`: Non-positive `winnerDriverNumber` or malformed request body.
+- `422 Unprocessable Entity`: 
+  - Winner driver did not race in this session.
+  - Outcome has already been recorded for this session (idempotency guard).
 
 ---
 
@@ -390,15 +415,6 @@ GET /api/v1/users
 
 # Get a specific user by ID
 GET /api/v1/users/{id}
-```
-
-**Response (200 OK):**
-```json
-{
-  "id": 1,
-  "username": "alice",
-  "balance": 140.00
-}
 ```
 
 ---
@@ -417,7 +433,7 @@ GET /api/v1/users/{userId}/bets
 
 ## End-to-End Walkthrough
 
-Here is a full cURL workflow testing the betting cycle:
+Here is a full cURL workflow testing the betting lifecycle:
 
 ```bash
 BASE=http://localhost:8080/api/v1
@@ -427,25 +443,25 @@ curl -s $BASE/users
 
 # 2. Browse available events
 curl -s "$BASE/events?sessionType=Race&year=2023&country=Italy"
-# Note sessionKey (e.g. "9161") and driverNumber (e.g. 1 for Verstappen, 44 for Hamilton)
+# Note sessionKey (e.g. "9157") and driverNumber (e.g. 1 for Verstappen, 44 for Hamilton)
 
 # 3. Alice (userId=1) places a 20 EUR bet on Max Verstappen (driver #1)
 curl -s -X POST $BASE/bets \
   -H "Content-Type: application/json" \
-  -d '{"userId":1,"sessionKey":"9161","driverNumber":1,"stakeAmount":20.00}'
+  -d '{"userId":1,"sessionKey":"9157","driverNumber":1,"stakeAmount":20.00}'
 # Alice balance is now 80.00 EUR; bet status is PENDING
 
 # 4. Bob (userId=2) places a 15 EUR bet on Lewis Hamilton (driver #44)
 curl -s -X POST $BASE/bets \
   -H "Content-Type: application/json" \
-  -d '{"userId":2,"sessionKey":"9161","driverNumber":44,"stakeAmount":15.00}'
+  -d '{"userId":2,"sessionKey":"9157","driverNumber":44,"stakeAmount":15.00}'
 # Bob balance is now 85.00 EUR; bet status is PENDING
 
 # 5. Review Alice's active bets
 curl -s $BASE/users/1/bets
 
 # 6. Record race outcome — Driver #1 (Verstappen) wins!
-curl -s -X POST $BASE/events/9161/outcome \
+curl -s -X POST $BASE/events/9157/outcome \
   -H "Content-Type: application/json" \
   -d '{"winnerDriverNumber":1}'
 # Alice's bet is marked WON and paid out (e.g. 20 * 3 = 60 EUR credited)
@@ -460,7 +476,7 @@ curl -s $BASE/users/2  # Balance: 85.00 EUR
 
 ## Error Handling
 
-All error responses adhere to a consistent JSON payload structure:
+All error responses adhere to a consistent, safe JSON payload structure without leaking database internals or stack traces:
 
 ```json
 {
@@ -473,26 +489,34 @@ All error responses adhere to a consistent JSON payload structure:
 ```
 
 Standard error codes:
-- `400 Bad Request`: Field validation error (e.g. negative stake).
+- `400 Bad Request`: Field validation error, malformed JSON body, or parameter type mismatch.
 - `404 Not Found`: Entity not found.
-- `422 Unprocessable Entity`: Business logic / rule violation.
-- `500 Internal Server Error`: Unexpected internal exceptions.
+- `409 Conflict`: Database unique constraint or data conflict.
+- `422 Unprocessable Entity`: Business rule violation (unregistered driver, outcome already recorded, insufficient balance).
+- `502 Bad Gateway`: External F1 API communication failure.
+- `500 Internal Server Error`: Generic internal error message (internal exception messages masked).
 
 ---
 
 ## Test Suite
 
-The project includes unit and integration tests covering all critical paths:
+The project includes **48 unit and integration tests** covering all critical business rules, concurrency scenarios, rate limiting, and failure handling:
 
 ```bash
 mvn test
 ```
 
 Test coverage includes:
-- **`OpenF1RateLimiterTest`**: Minute budget cap enforcement, sliding window pruning, cooldown on 429 response, and limiter reset.
-- **`OpenF1ClientTest`**: Outbound REST URL construction, query parameter encoding, and handling of 404/empty responses.
-- **`OpenF1EventProviderTest`**: TTL caching behavior, 429 backoff handling, negative caching on empty driver lists, and automatic fallback to baseline/mock grids.
-- **`EventControllerTest`**: MockMVC endpoint integration test verifying JSON response structures and driver market generation.
+- **`OutcomeServiceTest`**: Winner driver validation, win/loss bet settlements, user balance crediting, TOCTOU idempotency, and data integrity conflict handling.
+- **`OutcomeControllerTest`**: HTTP validation, winner input bounds checking, and malformed JSON parsing.
+- **`BettingServiceTest`**: Atomic balance debits, pessimistic lock execution, external driver validation, cancellation on timeout, and concurrent outcome race detection.
+- **`GlobalExceptionHandlerTest`**: Sanitized generic 500 responses, 409 conflict mapping, malformed JSON, and parameter type mismatch handling.
+- **`OpenF1EventProviderTest`**: Bounded LRU cache eviction under load, cancelled session filtering, driver deduplication, null team name fallback, and 429 cooldowns.
+- **`OpenF1RateLimiterTest`**: Sliding window cap enforcement, Resilience4j circuit breaker success and failure tracking, and 429 backoff.
+- **`OpenF1ClientTest`**: REST URL building, query encoding, and 404 handling.
+- **`EventControllerTest`**: MockMvc integration test for event market generation.
+- **`EventServiceTest`**: Bulk listing baseline optimization and driver market odds building.
+- **`UserTest`**: Domain balance debit/credit invariants and validation.
 
 ---
 
@@ -518,7 +542,7 @@ Test coverage includes:
 2. No service, domain, or controller modifications are needed.
 
 ### Switching Databases
-To switch from in-memory H2 to a persistent database (e.g., PostgreSQL, MySQL, Oracle):
+To switch from in-memory H2 to a persistent database (e.g., PostgreSQL, MySQL):
 1. Add the corresponding JDBC driver dependency to `pom.xml`.
 2. Update `spring.datasource.*` and `spring.jpa.database-platform` in `application.properties`.
 
@@ -544,13 +568,13 @@ f1-betting-app/
     │   │   │   │   └── SessionFilter.java           # Filter criteria
     │   │   │   └── openf1/
     │   │   │       ├── OpenF1Client.java            # RestTemplate HTTP client
-    │   │   │       ├── OpenF1EventProvider.java     # Primary provider with caching & fallback
+    │   │   │       ├── OpenF1EventProvider.java     # Primary provider with bounded LRU & fallback
     │   │   │       ├── OpenF1RateLimiter.java       # Token bucket & sliding window rate limiter
     │   │   │       └── dto/
     │   │   │           ├── OpenF1DriverDto.java     # OpenF1 driver payload
-    │   │   │           └── OpenF1SessionDto.java    # OpenF1 session payload
+    │   │   │           └── OpenF1SessionDto.java    # OpenF1 session payload (is_cancelled mapping)
     │   │   ├── config/
-    │   │   │   ├── AppConfig.java                   # RestTemplate bean configuration
+    │   │   │   ├── AppConfig.java                   # RestTemplate, validation executor & TransactionTemplate
     │   │   │   └── DataInitializer.java             # Seeds initial users & balances
     │   │   ├── controller/
     │   │   │   ├── BetController.java               # Bet placement & user bet history
@@ -559,7 +583,7 @@ f1-betting-app/
     │   │   │   └── UserController.java              # User details & wallet balances
     │   │   ├── domain/
     │   │   │   ├── Bet.java                         # Bet JPA entity
-    │   │   │   ├── EventOutcome.java                # EventOutcome JPA entity
+    │   │   │   ├── EventOutcome.java                # EventOutcome JPA entity (unique session_key)
     │   │   │   └── User.java                        # User JPA entity
     │   │   ├── dto/
     │   │   │   ├── BetDto.java
@@ -574,16 +598,17 @@ f1-betting-app/
     │   │   ├── exception/
     │   │   │   ├── BettingException.java
     │   │   │   ├── ErrorResponse.java
-    │   │   │   ├── GlobalExceptionHandler.java
+    │   │   │   ├── GlobalExceptionHandler.java      # Centralized exception mapping
     │   │   │   └── ResourceNotFoundException.java
     │   │   ├── repository/
     │   │   │   ├── BetRepository.java
     │   │   │   ├── EventOutcomeRepository.java
     │   │   │   └── UserRepository.java
     │   │   └── service/
-    │   │       ├── BettingService.java              # Bet validation, placement & balance deduction
-    │   │       ├── EventService.java                # Session querying & odds market generation
-    │   │       ├── OutcomeService.java              # Race outcome recording & bet payout
+    │   │       ├── BettingService.java              # Bet placement with decoupled external validation
+    │   │       ├── EventService.java                # Session querying & driver market generation
+    │   │       ├── OutcomeService.java              # Winner validation, outcome recording & bet payout
+    │   │       ├── SessionLockManager.java          # Fine-grained session locking for race prevention
     │   │       └── UserService.java                 # User lookups
     │   └── resources/
     │       └── application.properties               # H2, JPA, OpenF1, Rate limiter & Cache config
@@ -591,8 +616,17 @@ f1-betting-app/
         └── java/com/f1betting/
             ├── adapter/openf1/
             │   ├── OpenF1ClientTest.java            # Client HTTP & 404 tests
-            │   ├── OpenF1EventProviderTest.java     # Caching, 429 backoff & fallback tests
-            │   └── OpenF1RateLimiterTest.java       # Rate limiter & sliding window tests
-            └── controller/
-                └── EventControllerTest.java         # MockMvc integration tests
+            │   ├── OpenF1EventProviderTest.java     # Caching, bounded LRU, 429 backoff & fallback
+            │   └── OpenF1RateLimiterTest.java       # Rate limiter, circuit breaker & sliding window tests
+            ├── controller/
+            │   ├── EventControllerTest.java         # MockMvc event listing integration tests
+            │   └── OutcomeControllerTest.java       # MockMvc outcome & settlement endpoint tests
+            ├── domain/
+            │   └── UserTest.java                    # User balance debit/credit unit tests
+            ├── exception/
+            │   └── GlobalExceptionHandlerTest.java  # Security masking, 409 conflict & 400 error tests
+            └── service/
+                ├── BettingServiceTest.java          # Bet placement, lock & external validation tests
+                ├── EventServiceTest.java            # Event service & baseline grid tests
+                └── OutcomeServiceTest.java          # Winner validation, settlement & TOCTOU tests
 ```
