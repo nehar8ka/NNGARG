@@ -1,5 +1,7 @@
 package com.f1betting.adapter.openf1;
 
+import com.f1betting.adapter.openf1.exception.OpenF1RateLimitExceededException;
+
 import com.f1betting.adapter.mock.MockF1EventProvider;
 import com.f1betting.adapter.model.F1Driver;
 import com.f1betting.adapter.model.F1Session;
@@ -34,7 +36,7 @@ class OpenF1EventProviderTest {
     private MockF1EventProvider mockProvider = new MockF1EventProvider();
 
     @Spy
-    private OpenF1RateLimiter rateLimiter = new OpenF1RateLimiter(10, 50, 60);
+    private OpenF1RateLimiter rateLimiter = new OpenF1RateLimiter(10, 50, 60,20);
 
     @InjectMocks
     private OpenF1EventProvider provider;
@@ -130,11 +132,69 @@ class OpenF1EventProviderTest {
     @Test
     void testHttp429ActivatesCooldownAndFallsBack() {
         when(client.fetchDrivers("9081"))
-                .thenThrow(new HttpClientErrorException(HttpStatus.TOO_MANY_REQUESTS, "429 Too Many Requests"));
+                .thenThrow(new OpenF1RateLimitExceededException("429 Too Many Requests", 60L));
 
         List<F1Driver> drivers = provider.getDriversForSession("9081");
         assertNotNull(drivers);
         assertFalse(drivers.isEmpty());
         assertTrue(rateLimiter.isCooldownActive(), "Rate limiter cooldown should be activated on 429");
+    }
+@Test
+    void testConcurrentEnsureBaselineGridOnlyCallsClientOnce() throws Exception {
+        OpenF1DriverDto driverDto = new OpenF1DriverDto();
+        driverDto.setDriverNumber(1);
+        driverDto.setFullName("Max Verstappen");
+        driverDto.setNameAcronym("VER");
+
+        when(client.fetchLatestDrivers()).thenReturn(List.of(driverDto));
+        when(client.fetchDrivers(anyString())).thenReturn(List.of(driverDto));
+
+        int threadCount = 10;
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+        java.util.concurrent.CountDownLatch readyLatch = new java.util.concurrent.CountDownLatch(threadCount);
+        java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch doneLatch = new java.util.concurrent.CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            final String sessionKey = "session_" + i;
+            executor.submit(() -> {
+                readyLatch.countDown();
+                try {
+                    startLatch.await();
+                    provider.getDriversForSession(sessionKey);
+                } catch (Exception ignored) {
+                } finally {
+                    doneLatch.countDown();
+                }
+            });
+        }
+
+        readyLatch.await();
+        startLatch.countDown();
+        doneLatch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+        executor.shutdown();
+
+        // Baseline grid should be fetched AT MOST once despite 10 concurrent threads racing
+        verify(client, times(1)).fetchLatestDrivers();
+    }
+@Test
+    void testGetBaselineDriverGridReturnsLatestGrid() {
+        OpenF1DriverDto driverDto = new OpenF1DriverDto();
+        driverDto.setDriverNumber(44);
+        driverDto.setFullName("Lewis Hamilton");
+        driverDto.setNameAcronym("HAM");
+
+        when(client.fetchLatestDrivers()).thenReturn(List.of(driverDto));
+
+        List<F1Driver> grid = provider.getBaselineDriverGrid();
+        assertNotNull(grid);
+        assertEquals(1, grid.size());
+        assertEquals("Lewis Hamilton", grid.get(0).getFullName());
+        verify(client, times(1)).fetchLatestDrivers();
+
+        // 2nd call served from memory, no 2nd client call
+        List<F1Driver> grid2 = provider.getBaselineDriverGrid();
+        assertEquals(1, grid2.size());
+        verify(client, times(1)).fetchLatestDrivers();
     }
 }

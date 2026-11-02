@@ -109,4 +109,9 @@ public class MockF1EventProvider implements F1EventProvider {
     public List<F1Driver> getDriversForSession(String sessionKey) {
         return sessionDrivers.getOrDefault(sessionKey, sessionDrivers.get("9161"));
     }
+
+    @Override
+    public List<F1Driver> getBaselineDriverGrid() {
+        return getDriversForSession("9161");
+    }
 }

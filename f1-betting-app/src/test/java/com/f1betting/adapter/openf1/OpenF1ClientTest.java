@@ -2,12 +2,14 @@ package com.f1betting.adapter.openf1;
 
 import com.f1betting.adapter.openf1.dto.OpenF1DriverDto;
 import com.f1betting.adapter.openf1.dto.OpenF1SessionDto;
+import com.f1betting.adapter.openf1.exception.OpenF1RateLimitExceededException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -58,6 +60,23 @@ class OpenF1ClientTest {
         List<OpenF1DriverDto> result = client.fetchDrivers("9079");
         assertNotNull(result);
         assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void testFetchDrivers429ThrowsOpenF1RateLimitExceededExceptionWithRetryAfter() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Retry-After", "5");
+        HttpClientErrorException tooManyRequests = HttpClientErrorException.create(
+                HttpStatus.TOO_MANY_REQUESTS, "Too Many Requests", headers, null, null);
+
+        when(restTemplate.exchange(anyString(), eq(HttpMethod.GET), any(), eq(OpenF1DriverDto[].class)))
+                .thenThrow(tooManyRequests);
+
+        OpenF1RateLimitExceededException ex = assertThrows(
+                OpenF1RateLimitExceededException.class,
+                () -> client.fetchDrivers("9161")
+        );
+        assertEquals(5L, ex.getRetryAfterSeconds());
     }
 
     @Test

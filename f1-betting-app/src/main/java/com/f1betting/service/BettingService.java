@@ -14,13 +14,16 @@ import com.f1betting.repository.EventOutcomeRepository;
 import com.f1betting.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 /**
@@ -31,23 +34,24 @@ import java.util.stream.Collectors;
 @Slf4j
 public class BettingService {
 
-    private static final int[] POSSIBLE_ODDS = {2, 3, 4};
-
     private final BetRepository betRepository;
     private final UserRepository userRepository;
     private final EventOutcomeRepository eventOutcomeRepository;
     private final F1EventProvider f1EventProvider;
-    private final Random random = new Random();
+    private final OddsGenerator oddsGenerator;
+
+    @Value("${betting.driver-validation-timeout-seconds:8}")
+    private long driverValidationTimeoutSeconds = 8;
 
     /**
      * Places a single bet for a user on a driver to win a specified F1 session.
      *
      * <p>Business rules enforced:
      * <ol>
-     *   <li>The user must exist.</li>
      *   <li>The event must not already have a recorded outcome (no post-race bets).</li>
-     *   <li>The driver must be registered in the specified session.</li>
-     *   <li>The user must have sufficient balance to cover the stake.</li>
+     *   <li>The driver must be registered in the specified session (external I/O, no DB lock held).</li>
+     *   <li>The user must exist (pessimistic lock acquired immediately before balance check).</li>
+     *   <li>The user must have sufficient balance to cover the stake (enforced via User domain debit).</li>
      * </ol>
      *
      * <p>The stake is deducted from the user's balance immediately upon placement.
@@ -58,35 +62,28 @@ public class BettingService {
      */
     @Transactional
     public BetDto placeBet(PlaceBetRequest request) {
-        // Rule 1: User must exist
-        User user = userRepository.findById(request.getUserId())
-                .orElseThrow(() -> new ResourceNotFoundException(
-                        "User not found with id: " + request.getUserId()));
-
-        // Rule 2: Cannot bet on an event that already has a recorded outcome
+        // Rule 2: Cannot bet on an event that already has a recorded outcome (fast fail, no lock needed)
         if (eventOutcomeRepository.existsBySessionKey(request.getSessionKey())) {
             throw new BettingException(
                     "Event with sessionKey '" + request.getSessionKey() +
                     "' already has a recorded outcome. No further bets are accepted.");
         }
 
-        // Rule 3: Driver must participate in the session
+        // Rule 3: Driver must participate in the session (external network call executed BEFORE acquiring DB lock)
         validateDriverInSession(request.getSessionKey(), request.getDriverNumber());
 
-        // Rule 4: Sufficient balance
-        if (user.getBalance().compareTo(request.getStakeAmount()) < 0) {
-            throw new BettingException(
-                    "Insufficient balance. Available: " + user.getBalance() +
-                    " EUR, Required: " + request.getStakeAmount() + " EUR.");
-        }
+        // Rule 1: User must exist & acquire pessimistic write lock right before balance debit
+        User user = userRepository.findByIdForUpdate(request.getUserId())
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "User not found with id: " + request.getUserId()));
+
+        // Rule 4: Debit stake from user balance (enforces balance invariant, throws if insufficient)
+        user.debit(request.getStakeAmount());
+        userRepository.save(user);
 
         // Generate odds and calculate potential payout
-        int odds = randomOdds();
+        int odds = oddsGenerator.generateOdds();
         BigDecimal potentialPayout = request.getStakeAmount().multiply(BigDecimal.valueOf(odds));
-
-        // Deduct stake from balance immediately
-        user.setBalance(user.getBalance().subtract(request.getStakeAmount()));
-        userRepository.save(user);
 
         // Persist the bet
         Bet bet = Bet.builder()
@@ -130,20 +127,29 @@ public class BettingService {
 
     /**
      * Verifies that the given driver number is present in the session by calling
-     * the F1 event provider. Throws {@link BettingException} if not found.
+     * the F1 event provider within a bounded timeout. Throws {@link BettingException} if not found or timed out.
      */
     private void validateDriverInSession(String sessionKey, Integer driverNumber) {
-        List<F1Driver> drivers = f1EventProvider.getDriversForSession(sessionKey);
-        boolean found = drivers.stream()
+        List<F1Driver> drivers;
+        try {
+            drivers = CompletableFuture.supplyAsync(() -> f1EventProvider.getDriversForSession(sessionKey))
+                    .get(driverValidationTimeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new BettingException("Timed out validating driver registration with F1 provider for session '" + sessionKey + "'. Please try again.");
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof BettingException be) {
+                throw be;
+            }
+            throw new BettingException("Could not verify driver registration for session '" + sessionKey + "': " + cause.getMessage());
+        }
+
+        boolean found = drivers != null && drivers.stream()
                 .anyMatch(d -> driverNumber.equals(d.getDriverNumber()));
         if (!found) {
             throw new BettingException(
                     "Driver #" + driverNumber + " is not registered in session '" + sessionKey + "'.");
         }
-    }
-
-    private int randomOdds() {
-        return POSSIBLE_ODDS[random.nextInt(POSSIBLE_ODDS.length)];
     }
 
     private BetDto toDto(Bet bet) {

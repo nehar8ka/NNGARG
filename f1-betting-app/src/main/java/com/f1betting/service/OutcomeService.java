@@ -83,8 +83,11 @@ public class OutcomeService {
                 bet.setStatus(BetStatus.WON);
 
                 // Credit payout to the user's balance
-                User user = bet.getUser();
-                user.setBalance(user.getBalance().add(bet.getPotentialPayout()));
+                User user = userRepository.findByIdForUpdate(bet.getUser().getId()).
+                        orElseThrow(()->new ResourceNotFoundException(
+                                "User not found with id: "+ bet.getUser().getId()
+                        ));
+                user.credit(bet.getPotentialPayout());
                 userRepository.save(user);
 
                 totalPaidOut = totalPaidOut.add(bet.getPotentialPayout());

@@ -14,7 +14,7 @@ import java.time.LocalDateTime;
  * A single bet placed by a user on a driver to win a specific F1 session.
  */
 @Entity
-@Table(name = "f1_bets")
+@Table(name = "f1_bets",indexes = @Index(name="idx_bets_Session_status",columnList = "sessionKey ,status"))
 @Data
 @Builder
 @NoArgsConstructor

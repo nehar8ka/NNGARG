@@ -30,4 +30,12 @@ public interface F1EventProvider {
      * @return list of drivers, never null
      */
     List<F1Driver> getDriversForSession(String sessionKey);
+
+    /**
+     * Retrieves a baseline grid of F1 drivers using a single request or cached roster.
+     * Used for bulk event enrichment to prevent N+1 queries.
+     *
+     * @return list of baseline drivers, never null
+     */
+    List<F1Driver> getBaselineDriverGrid();
 }

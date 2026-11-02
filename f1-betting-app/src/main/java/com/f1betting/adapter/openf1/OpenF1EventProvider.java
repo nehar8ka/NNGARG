@@ -7,6 +7,7 @@ import com.f1betting.adapter.model.F1Session;
 import com.f1betting.adapter.model.SessionFilter;
 import com.f1betting.adapter.openf1.dto.OpenF1DriverDto;
 import com.f1betting.adapter.openf1.dto.OpenF1SessionDto;
+import com.f1betting.adapter.openf1.exception.OpenF1RateLimitExceededException;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -55,6 +56,7 @@ public class OpenF1EventProvider implements F1EventProvider {
 
     private final Map<String, CacheEntry<List<F1Session>>> sessionCache = new ConcurrentHashMap<>();
     private final Map<String, CacheEntry<List<F1Driver>>> driverCache = new ConcurrentHashMap<>();
+    private final Object baselineLock = new Object();
     private volatile List<F1Driver> lastKnownGrid = null;
 
     @Override
@@ -100,11 +102,14 @@ public class OpenF1EventProvider implements F1EventProvider {
 
             sessionCache.put(cacheKey, new CacheEntry<>(sessions, sessionTtlMinutes * 60_000L));
             return sessions;
+        } catch (OpenF1RateLimitExceededException ex) {
+            handleRateLimit429(ex.getRetryAfterSeconds(), "sessions lookup");
+            return mockProvider.getSessions(filter);
         } catch (HttpClientErrorException.TooManyRequests ex) {
-            handleRateLimit429(ex, "sessions lookup");
+            handleRateLimit429(extractRetryAfter(ex), "sessions lookup");
             return mockProvider.getSessions(filter);
         } catch (Exception ex) {
-            handleRateLimitOrFailure(ex, "sessions lookup");
+            handleFailure(ex, "sessions lookup");
             return mockProvider.getSessions(filter);
         }
     }
@@ -160,13 +165,18 @@ public class OpenF1EventProvider implements F1EventProvider {
             driverCache.put(sessionKey, new CacheEntry<>(drivers, driverTtlMinutes * 60_000L));
             lastKnownGrid = drivers;
             return drivers;
+        } catch (OpenF1RateLimitExceededException ex) {
+            handleRateLimit429(ex.getRetryAfterSeconds(), "drivers lookup for session " + sessionKey);
+            List<F1Driver> fallback = getFallbackDrivers(sessionKey);
+            driverCache.put(sessionKey, new CacheEntry<>(fallback, negativeTtlMinutes * 60_000L));
+            return fallback;
         } catch (HttpClientErrorException.TooManyRequests ex) {
-            handleRateLimit429(ex, "drivers lookup for session " + sessionKey);
+            handleRateLimit429(extractRetryAfter(ex), "drivers lookup for session " + sessionKey);
             List<F1Driver> fallback = getFallbackDrivers(sessionKey);
             driverCache.put(sessionKey, new CacheEntry<>(fallback, negativeTtlMinutes * 60_000L));
             return fallback;
         } catch (Exception ex) {
-            handleRateLimitOrFailure(ex, "drivers lookup for session " + sessionKey);
+            handleFailure(ex, "drivers lookup for session " + sessionKey);
             List<F1Driver> fallback = getFallbackDrivers(sessionKey);
             driverCache.put(sessionKey, new CacheEntry<>(fallback, negativeTtlMinutes * 60_000L));
             return fallback;
@@ -176,54 +186,74 @@ public class OpenF1EventProvider implements F1EventProvider {
     /**
      * Pre-warms the baseline grid with authentic F1 drivers using a single call to /drivers?session_key=latest.
      */
+    @Override
+    public List<F1Driver> getBaselineDriverGrid() {
+        ensureBaselineGrid();
+        return getFallbackDrivers("latest");
+    }
+
     private void ensureBaselineGrid() {
         if (lastKnownGrid != null && !lastKnownGrid.isEmpty()) {
             return;
         }
-        if (!rateLimiter.tryAcquire()) {
-            return;
-        }
-        try {
-            if (rateLimiter.acquireWithThrottle()) {
-                log.info("Fetching latest F1 grid from OpenF1 to establish baseline...");
-                List<OpenF1DriverDto> latestRaw = client.fetchLatestDrivers();
-                if (latestRaw != null && !latestRaw.isEmpty()) {
-                    lastKnownGrid = latestRaw.stream()
-                            .map(this::toF1Driver)
-                            .collect(Collectors.toList());
-                    log.info("Successfully established baseline grid with {} drivers from OpenF1.", lastKnownGrid.size());
-                }
+        synchronized (baselineLock) {
+            if (lastKnownGrid != null && !lastKnownGrid.isEmpty()) {
+                return;
             }
-        } catch (Exception e) {
-            log.warn("Could not pre-warm baseline grid from OpenF1: {}", e.getMessage());
+            if (!rateLimiter.tryAcquire()) {
+                return;
+            }
+            try {
+                if (rateLimiter.acquireWithThrottle()) {
+                    log.info("Fetching latest F1 grid from OpenF1 to establish baseline...");
+                    List<OpenF1DriverDto> latestRaw = client.fetchLatestDrivers();
+                    if (latestRaw != null && !latestRaw.isEmpty()) {
+                        lastKnownGrid = latestRaw.stream()
+                                .map(this::toF1Driver)
+                                .collect(Collectors.toList());
+                        log.info("Successfully established baseline grid with {} drivers from OpenF1.", lastKnownGrid.size());
+                    }
+                }
+            } catch (OpenF1RateLimitExceededException ex) {
+                handleRateLimit429(ex.getRetryAfterSeconds(), "baseline grid pre-warm");
+            } catch (HttpClientErrorException.TooManyRequests ex) {
+                handleRateLimit429(extractRetryAfter(ex), "baseline grid pre-warm");
+            } catch (Exception e) {
+                log.warn("Could not pre-warm baseline grid from OpenF1: {}", e.getMessage());
+                handleFailure(e, "baseline grid pre-warm");
+            }
         }
     }
 
-    private void handleRateLimit429(HttpClientErrorException.TooManyRequests ex, String operation) {
-        Long retryAfterSeconds = null;
-        try {
-            HttpHeaders headers = ex.getResponseHeaders();
-            if (headers != null) {
-                String retryAfterStr = headers.getFirst("Retry-After");
-                if (retryAfterStr != null && !retryAfterStr.isBlank()) {
-                    retryAfterSeconds = Long.parseLong(retryAfterStr.trim());
-                }
-            }
-        } catch (Exception ignored) {
-        }
+    private void handleRateLimit429(Long retryAfterSeconds, String operation) {
         rateLimiter.recordRateLimit429(retryAfterSeconds);
         log.warn("OpenF1 rate limit reached (429) during {}. Activating cooldown ({}s); using fallback data.",
                 operation, (retryAfterSeconds != null ? retryAfterSeconds : 60));
     }
 
-    private void handleRateLimitOrFailure(Exception ex, String operation) {
-        String message = ex.getMessage() != null ? ex.getMessage() : "";
-        if (message.contains("429") || message.toLowerCase().contains("too many requests")) {
-            rateLimiter.recordRateLimit429(null);
-            log.warn("OpenF1 rate limit detected during {}. Activating cooldown; using fallback data.", operation);
+    private void handleFailure(Exception ex, String operation) {
+        if (ex instanceof OpenF1RateLimitExceededException rle) {
+            handleRateLimit429(rle.getRetryAfterSeconds(), operation);
+        } else if (ex instanceof HttpClientErrorException.TooManyRequests tmr) {
+            handleRateLimit429(extractRetryAfter(tmr), operation);
         } else {
-            log.warn("OpenF1 {} failed ({}); falling back to built-in data.", operation, message);
+            rateLimiter.recordFailure();
+            log.warn("OpenF1 {} failed ({}); falling back to built-in data.", operation, ex.getMessage());
         }
+    }
+
+    private Long extractRetryAfter(HttpClientErrorException ex) {
+        try {
+            HttpHeaders headers = ex.getResponseHeaders();
+            if (headers != null) {
+                String retryAfterStr = headers.getFirst("Retry-After");
+                if (retryAfterStr != null && !retryAfterStr.isBlank()) {
+                    return Long.parseLong(retryAfterStr.trim());
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private List<F1Driver> getFallbackDrivers(String sessionKey) {

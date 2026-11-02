@@ -2,6 +2,7 @@ package com.f1betting.adapter.openf1;
 
 import com.f1betting.adapter.openf1.dto.OpenF1DriverDto;
 import com.f1betting.adapter.openf1.dto.OpenF1SessionDto;
+import com.f1betting.adapter.openf1.exception.OpenF1RateLimitExceededException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -81,6 +82,10 @@ public class OpenF1Client {
                 log.debug("OpenF1 returned 404 for sessions query: {}", url);
                 return Collections.emptyList();
             }
+            if (ex.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS) {
+                Long retryAfter = extractRetryAfter(ex);
+                throw new OpenF1RateLimitExceededException("OpenF1 rate limit (429) exceeded for: " + url, retryAfter, ex);
+            }
             throw ex;
         }
     }
@@ -114,6 +119,10 @@ public class OpenF1Client {
                 log.debug("OpenF1 returned 404 Not Found for session {} drivers (session may be cancelled or no data available)", sessionKey);
                 return Collections.emptyList();
             }
+            if (ex.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS) {
+                Long retryAfter = extractRetryAfter(ex);
+                throw new OpenF1RateLimitExceededException("OpenF1 rate limit (429) exceeded for: " + url, retryAfter, ex);
+            }
             throw ex;
         }
     }
@@ -125,5 +134,19 @@ public class OpenF1Client {
      */
     public List<OpenF1DriverDto> fetchLatestDrivers() {
         return fetchDrivers("latest");
+    }
+
+    private Long extractRetryAfter(HttpClientErrorException ex) {
+        try {
+            HttpHeaders headers = ex.getResponseHeaders();
+            if (headers != null) {
+                String retryAfterStr = headers.getFirst("Retry-After");
+                if (retryAfterStr != null && !retryAfterStr.isBlank()) {
+                    return Long.parseLong(retryAfterStr.trim());
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 }

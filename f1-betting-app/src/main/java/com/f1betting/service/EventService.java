@@ -8,10 +8,10 @@ import com.f1betting.dto.DriverMarketDto;
 import com.f1betting.dto.EventDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Random;
 import java.util.stream.Collectors;
 
 /**
@@ -24,15 +24,19 @@ import java.util.stream.Collectors;
 @Slf4j
 public class EventService {
 
-    /** Possible odds values per the requirements. */
-    private static final int[] POSSIBLE_ODDS = {2, 3, 4};
-
     private final F1EventProvider f1EventProvider;
-    private final Random random = new Random();
+    private final OddsGenerator oddsGenerator;
+
+    @Value("${events.bulk-listing-threshold:20}")
+    private int bulkListingThreshold = 20;
 
     /**
      * Retrieves F1 sessions from the external provider, applying optional filters,
      * and enriches each session with a driver market containing randomly generated odds.
+     *
+     * <p>If the result size exceeds {@code bulkListingThreshold}, a single baseline
+     * driver grid is fetched once and reused across all sessions to prevent N+1 API calls.
+     * Otherwise, session-specific drivers are queried live.
      *
      * @param sessionType optional session type filter (e.g. "Race", "Qualifying")
      * @param year        optional year filter
@@ -48,6 +52,15 @@ public class EventService {
 
         List<F1Session> sessions = f1EventProvider.getSessions(filter);
         log.info("Building event DTOs for {} sessions.", sessions.size());
+
+        if (sessions.size() > bulkListingThreshold) {
+            log.info("Bulk session count ({} > threshold {}); using single baseline driver grid.",
+                    sessions.size(), bulkListingThreshold);
+            List<F1Driver> baselineGrid = f1EventProvider.getBaselineDriverGrid();
+            return sessions.stream()
+                    .map(session -> toEventDtoWithDrivers(session, baselineGrid))
+                    .collect(Collectors.toList());
+        }
 
         return sessions.stream()
                 .map(this::toEventDto)
@@ -67,6 +80,10 @@ public class EventService {
             drivers = List.of();
         }
 
+        return toEventDtoWithDrivers(session, drivers);
+    }
+
+    private EventDto toEventDtoWithDrivers(F1Session session, List<F1Driver> drivers) {
         List<DriverMarketDto> market = drivers.stream()
                 .map(this::toDriverMarketDto)
                 .collect(Collectors.toList());
@@ -91,14 +108,7 @@ public class EventService {
                 .fullName(driver.getFullName())
                 .nameAcronym(driver.getNameAcronym())
                 .teamName(driver.getTeamName())
-                .odds(randomOdds())
+                .odds(oddsGenerator.generateOdds())
                 .build();
-    }
-
-    /**
-     * Generates a random odds value of 2, 3, or 4 as per the requirements.
-     */
-    private int randomOdds() {
-        return POSSIBLE_ODDS[random.nextInt(POSSIBLE_ODDS.length)];
     }
 }
