@@ -12,7 +12,7 @@ class OpenF1RateLimiterTest {
     @BeforeEach
     void setUp() {
         // 3 req/sec, max 5 req/min, 2s cooldown for fast test execution
-        rateLimiter = new OpenF1RateLimiter(3, 5, 2,2);
+        rateLimiter = new OpenF1RateLimiter(3, 5, 2, 2);
     }
 
     @Test
@@ -37,6 +37,12 @@ class OpenF1RateLimiterTest {
         assertTrue(rateLimiter.isCooldownActive());
         assertFalse(rateLimiter.tryAcquire());
         assertFalse(rateLimiter.acquireWithThrottle());
+    }
+
+    @Test
+    void testRecordSuccessUpdatesCircuitBreaker() {
+        rateLimiter.recordSuccess(100L);
+        assertEquals(1, rateLimiter.getResilienceCircuitBreaker().getMetrics().getNumberOfSuccessfulCalls());
     }
 
     @Test

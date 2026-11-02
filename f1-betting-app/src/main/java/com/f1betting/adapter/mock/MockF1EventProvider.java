@@ -26,7 +26,7 @@ public class MockF1EventProvider implements F1EventProvider {
 
     private void initData() {
         F1Session monza2023 = F1Session.builder()
-                .sessionKey("9161")
+                .sessionKey("9157")
                 .sessionName("Race")
                 .sessionType("Race")
                 .year(2023)
@@ -38,7 +38,7 @@ public class MockF1EventProvider implements F1EventProvider {
                 .build();
 
         F1Session monaco2024 = F1Session.builder()
-                .sessionKey("9520")
+                .sessionKey("9523")
                 .sessionName("Race")
                 .sessionType("Race")
                 .year(2024)
@@ -50,7 +50,7 @@ public class MockF1EventProvider implements F1EventProvider {
                 .build();
 
         F1Session silverstone2024 = F1Session.builder()
-                .sessionKey("9540")
+                .sessionKey("9558")
                 .sessionName("Race")
                 .sessionType("Race")
                 .year(2024)
@@ -91,6 +91,10 @@ public class MockF1EventProvider implements F1EventProvider {
         for (F1Session session : mockSessions) {
             sessionDrivers.put(session.getSessionKey(), standardGrid);
         }
+        // Backward-compatibility aliases for existing test keys
+        sessionDrivers.put("9161", standardGrid);
+        sessionDrivers.put("9520", standardGrid);
+        sessionDrivers.put("9540", standardGrid);
     }
 
     @Override
@@ -107,11 +111,11 @@ public class MockF1EventProvider implements F1EventProvider {
 
     @Override
     public List<F1Driver> getDriversForSession(String sessionKey) {
-        return sessionDrivers.getOrDefault(sessionKey, sessionDrivers.get("9161"));
+        return sessionDrivers.getOrDefault(sessionKey, sessionDrivers.get("9157"));
     }
 
     @Override
     public List<F1Driver> getBaselineDriverGrid() {
-        return getDriversForSession("9161");
+        return getDriversForSession("9157");
     }
 }

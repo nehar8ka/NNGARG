@@ -16,6 +16,9 @@ public class OpenF1DriverDto {
     @JsonProperty("full_name")
     private String fullName;
 
+    @JsonProperty("broadcast_name")
+    private String broadcastName;
+
     @JsonProperty("name_acronym")
     private String nameAcronym;
 

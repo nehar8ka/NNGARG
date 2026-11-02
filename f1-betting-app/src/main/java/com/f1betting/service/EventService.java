@@ -12,6 +12,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -84,9 +86,12 @@ public class EventService {
     }
 
     private EventDto toEventDtoWithDrivers(F1Session session, List<F1Driver> drivers) {
-        List<DriverMarketDto> market = drivers.stream()
-                .map(this::toDriverMarketDto)
-                .collect(Collectors.toList());
+        List<DriverMarketDto> market = drivers != null
+                ? drivers.stream()
+                    .filter(Objects::nonNull)
+                    .map(this::toDriverMarketDto)
+                    .collect(Collectors.toList())
+                : List.of();
 
         return EventDto.builder()
                 .sessionKey(session.getSessionKey())
@@ -103,11 +108,16 @@ public class EventService {
     }
 
     private DriverMarketDto toDriverMarketDto(F1Driver driver) {
+        String teamName = driver.getTeamName();
+        if (teamName == null || teamName.isBlank()) {
+            teamName = "Unassigned";
+        }
+
         return DriverMarketDto.builder()
                 .driverNumber(driver.getDriverNumber())
                 .fullName(driver.getFullName())
                 .nameAcronym(driver.getNameAcronym())
-                .teamName(driver.getTeamName())
+                .teamName(teamName)
                 .odds(oddsGenerator.generateOdds())
                 .build();
     }

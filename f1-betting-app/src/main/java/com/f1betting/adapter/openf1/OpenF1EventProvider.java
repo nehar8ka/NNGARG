@@ -17,9 +17,10 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpClientErrorException;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -28,8 +29,10 @@ import java.util.stream.Collectors;
  *
  * <p>Includes:
  * <ul>
- *   <li>In-memory TTL caching for sessions and driver grids</li>
+ *   <li>Bounded thread-safe LRU caching with TTL for sessions and driver grids (prevents memory exhaustion)</li>
  *   <li>Negative caching for sessions with 404 / no telemetry (e.g. cancelled events)</li>
+ *   <li>Filtering of cancelled events (is_cancelled == true)</li>
+ *   <li>Deduplication and null-safe normalization of driver rosters</li>
  *   <li>Proactive client-side rate limiting (token bucket / sliding window) to prevent HTTP 429</li>
  *   <li>Automatic HTTP 429 backoff / cooldown honoring Retry-After headers</li>
  *   <li>Transparent fallback to cached baseline grid or mock F1 data when offline or rate-limited</li>
@@ -40,6 +43,9 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 @Slf4j
 public class OpenF1EventProvider implements F1EventProvider {
+
+    private static final int MAX_SESSION_CACHE_SIZE = 200;
+    private static final int MAX_DRIVER_CACHE_SIZE = 500;
 
     private final OpenF1Client client;
     private final MockF1EventProvider mockProvider;
@@ -54,8 +60,22 @@ public class OpenF1EventProvider implements F1EventProvider {
     @Value("${openf1.cache.negative-ttl-minutes:15}")
     private long negativeTtlMinutes = 15;
 
-    private final Map<String, CacheEntry<List<F1Session>>> sessionCache = new ConcurrentHashMap<>();
-    private final Map<String, CacheEntry<List<F1Driver>>> driverCache = new ConcurrentHashMap<>();
+    private final Map<String, CacheEntry<List<F1Session>>> sessionCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CacheEntry<List<F1Session>>> eldest) {
+                    return size() > MAX_SESSION_CACHE_SIZE || eldest.getValue().isExpired();
+                }
+            });
+
+    private final Map<String, CacheEntry<List<F1Driver>>> driverCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CacheEntry<List<F1Driver>>> eldest) {
+                    return size() > MAX_DRIVER_CACHE_SIZE || eldest.getValue().isExpired();
+                }
+            });
+
     private final Object baselineLock = new Object();
     private volatile List<F1Driver> lastKnownGrid = null;
 
@@ -83,12 +103,14 @@ public class OpenF1EventProvider implements F1EventProvider {
         }
 
         // 4. Attempt live fetch from OpenF1
+        long startTime = System.currentTimeMillis();
         try {
             String sessionType = (filter != null) ? filter.getSessionType() : null;
             Integer year       = (filter != null) ? filter.getYear()        : null;
             String country     = (filter != null) ? filter.getCountry()     : null;
 
             List<OpenF1SessionDto> raw = client.fetchSessions(sessionType, year, country);
+            rateLimiter.recordSuccess(System.currentTimeMillis() - startTime);
             log.info("OpenF1 returned {} sessions for filter: {}", raw.size(), filter);
 
             if (raw.isEmpty()) {
@@ -96,7 +118,9 @@ public class OpenF1EventProvider implements F1EventProvider {
                 return mockProvider.getSessions(filter);
             }
 
+            // Filter out cancelled events and map to internal domain model
             List<F1Session> sessions = raw.stream()
+                    .filter(s -> !Boolean.TRUE.equals(s.getIsCancelled()))
                     .map(this::toF1Session)
                     .collect(Collectors.toList());
 
@@ -133,7 +157,6 @@ public class OpenF1EventProvider implements F1EventProvider {
         if (!rateLimiter.tryAcquire()) {
             log.debug("OpenF1 rate limit reached or cooldown active. Using fallback grid for session {}", sessionKey);
             List<F1Driver> fallback = getFallbackDrivers(sessionKey);
-            // Negative/fallback cache: remember this fallback so we do not retry this session repeatedly
             driverCache.put(sessionKey, new CacheEntry<>(fallback, negativeTtlMinutes * 60_000L));
             return fallback;
         }
@@ -146,8 +169,10 @@ public class OpenF1EventProvider implements F1EventProvider {
         }
 
         // 5. Attempt live fetch from OpenF1
+        long startTime = System.currentTimeMillis();
         try {
             List<OpenF1DriverDto> raw = client.fetchDrivers(sessionKey);
+            rateLimiter.recordSuccess(System.currentTimeMillis() - startTime);
 
             if (raw.isEmpty()) {
                 // E.g. session was cancelled or no drivers registered in OpenF1 (Imola 2023, etc.)
@@ -157,9 +182,16 @@ public class OpenF1EventProvider implements F1EventProvider {
                 return fallback;
             }
 
+            // Normalize and deduplicate drivers by driverNumber
             List<F1Driver> drivers = raw.stream()
-                    .map(this::toF1Driver)
-                    .collect(Collectors.toList());
+                    .filter(d -> d.getDriverNumber() != null)
+                    .collect(Collectors.toMap(
+                            OpenF1DriverDto::getDriverNumber,
+                            this::toF1Driver,
+                            (existing, replacement) -> existing,
+                            LinkedHashMap::new
+                    ))
+                    .values().stream().toList();
 
             log.info("OpenF1 returned {} drivers for session {}", drivers.size(), sessionKey);
             driverCache.put(sessionKey, new CacheEntry<>(drivers, driverTtlMinutes * 60_000L));
@@ -205,12 +237,21 @@ public class OpenF1EventProvider implements F1EventProvider {
             }
             try {
                 if (rateLimiter.acquireWithThrottle()) {
+                    long startTime = System.currentTimeMillis();
                     log.info("Fetching latest F1 grid from OpenF1 to establish baseline...");
                     List<OpenF1DriverDto> latestRaw = client.fetchLatestDrivers();
+                    rateLimiter.recordSuccess(System.currentTimeMillis() - startTime);
+
                     if (latestRaw != null && !latestRaw.isEmpty()) {
                         lastKnownGrid = latestRaw.stream()
-                                .map(this::toF1Driver)
-                                .collect(Collectors.toList());
+                                .filter(d -> d.getDriverNumber() != null)
+                                .collect(Collectors.toMap(
+                                        OpenF1DriverDto::getDriverNumber,
+                                        this::toF1Driver,
+                                        (existing, replacement) -> existing,
+                                        LinkedHashMap::new
+                                ))
+                                .values().stream().toList();
                         log.info("Successfully established baseline grid with {} drivers from OpenF1.", lastKnownGrid.size());
                     }
                 }
@@ -301,11 +342,28 @@ public class OpenF1EventProvider implements F1EventProvider {
     }
 
     private F1Driver toF1Driver(OpenF1DriverDto dto) {
+        String fullName = dto.getFullName();
+        if (fullName == null || fullName.isBlank()) {
+            fullName = dto.getBroadcastName() != null && !dto.getBroadcastName().isBlank()
+                    ? dto.getBroadcastName()
+                    : "Driver #" + dto.getDriverNumber();
+        }
+
+        String teamName = dto.getTeamName();
+        if (teamName == null || teamName.isBlank()) {
+            teamName = "Unassigned";
+        }
+
+        String acronym = dto.getNameAcronym();
+        if (acronym == null || acronym.isBlank()) {
+            acronym = fullName.length() >= 3 ? fullName.substring(0, 3).toUpperCase() : "DRV";
+        }
+
         return F1Driver.builder()
                 .driverNumber(dto.getDriverNumber())
-                .fullName(dto.getFullName())
-                .nameAcronym(dto.getNameAcronym())
-                .teamName(dto.getTeamName())
+                .fullName(fullName)
+                .nameAcronym(acronym)
+                .teamName(teamName)
                 .countryCode(dto.getCountryCode())
                 .build();
     }

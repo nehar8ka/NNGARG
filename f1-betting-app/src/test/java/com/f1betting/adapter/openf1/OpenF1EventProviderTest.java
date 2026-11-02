@@ -15,12 +15,11 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.web.client.HttpClientErrorException;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -36,7 +35,7 @@ class OpenF1EventProviderTest {
     private MockF1EventProvider mockProvider = new MockF1EventProvider();
 
     @Spy
-    private OpenF1RateLimiter rateLimiter = new OpenF1RateLimiter(10, 50, 60,20);
+    private OpenF1RateLimiter rateLimiter = new OpenF1RateLimiter(10, 50, 60, 20);
 
     @InjectMocks
     private OpenF1EventProvider provider;
@@ -79,6 +78,26 @@ class OpenF1EventProviderTest {
     }
 
     @Test
+    void testGetSessionsFiltersCancelledSessions() {
+        OpenF1SessionDto activeSession = new OpenF1SessionDto();
+        activeSession.setSessionKey(9157);
+        activeSession.setSessionName("Race");
+        activeSession.setIsCancelled(false);
+
+        OpenF1SessionDto cancelledSession = new OpenF1SessionDto();
+        cancelledSession.setSessionKey(9086);
+        cancelledSession.setSessionName("Race (Cancelled)");
+        cancelledSession.setIsCancelled(true);
+
+        when(client.fetchSessions(any(), any(), any()))
+                .thenReturn(List.of(activeSession, cancelledSession));
+
+        List<F1Session> sessions = provider.getSessions(null);
+        assertEquals(1, sessions.size());
+        assertEquals("9157", sessions.get(0).getSessionKey());
+    }
+
+    @Test
     void testGetDriversForSessionCachesResults() {
         OpenF1DriverDto driverDto = new OpenF1DriverDto();
         driverDto.setDriverNumber(1);
@@ -97,6 +116,56 @@ class OpenF1EventProviderTest {
         List<F1Driver> second = provider.getDriversForSession("9161");
         assertEquals(1, second.size());
         verify(client, times(1)).fetchDrivers("9161");
+    }
+
+    @Test
+    void testGetDriversNormalizesNullTeamAndDeduplicates() {
+        OpenF1DriverDto driver1 = new OpenF1DriverDto();
+        driver1.setDriverNumber(1);
+        driver1.setFullName("Max Verstappen");
+        driver1.setTeamName(null);
+
+        OpenF1DriverDto driver1Dup = new OpenF1DriverDto();
+        driver1Dup.setDriverNumber(1);
+        driver1Dup.setFullName("Max Verstappen Duplicate");
+        driver1Dup.setTeamName("Red Bull");
+
+        OpenF1DriverDto driver50 = new OpenF1DriverDto();
+        driver50.setDriverNumber(50);
+        driver50.setFullName(null);
+        driver50.setBroadcastName("R HIRAKAWA");
+        driver50.setTeamName("");
+
+        when(client.fetchDrivers("latest")).thenReturn(List.of(driver1, driver1Dup, driver50));
+
+        List<F1Driver> drivers = provider.getDriversForSession("latest");
+        assertEquals(2, drivers.size());
+
+        F1Driver first = drivers.get(0);
+        assertEquals(1, first.getDriverNumber());
+        assertEquals("Unassigned", first.getTeamName());
+
+        F1Driver second = drivers.get(1);
+        assertEquals(50, second.getDriverNumber());
+        assertEquals("R HIRAKAWA", second.getFullName());
+        assertEquals("Unassigned", second.getTeamName());
+    }
+
+    @Test
+    void testCacheBoundsPreventUnboundedGrowth() {
+        OpenF1DriverDto driverDto = new OpenF1DriverDto();
+        driverDto.setDriverNumber(1);
+        driverDto.setFullName("Max Verstappen");
+        when(client.fetchDrivers(anyString())).thenReturn(List.of(driverDto));
+
+        // Insert 550 sessions (threshold is 500)
+        for (int i = 0; i < 550; i++) {
+            provider.getDriversForSession("sess_" + i);
+        }
+
+        Map<?, ?> driverCache = (Map<?, ?>) ReflectionTestUtils.getField(provider, "driverCache");
+        assertNotNull(driverCache);
+        assertTrue(driverCache.size() <= 500, "driverCache should be bounded to 500 max entries, actual: " + driverCache.size());
     }
 
     @Test
@@ -139,7 +208,8 @@ class OpenF1EventProviderTest {
         assertFalse(drivers.isEmpty());
         assertTrue(rateLimiter.isCooldownActive(), "Rate limiter cooldown should be activated on 429");
     }
-@Test
+
+    @Test
     void testConcurrentEnsureBaselineGridOnlyCallsClientOnce() throws Exception {
         OpenF1DriverDto driverDto = new OpenF1DriverDto();
         driverDto.setDriverNumber(1);
@@ -177,7 +247,8 @@ class OpenF1EventProviderTest {
         // Baseline grid should be fetched AT MOST once despite 10 concurrent threads racing
         verify(client, times(1)).fetchLatestDrivers();
     }
-@Test
+
+    @Test
     void testGetBaselineDriverGridReturnsLatestGrid() {
         OpenF1DriverDto driverDto = new OpenF1DriverDto();
         driverDto.setDriverNumber(44);

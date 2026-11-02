@@ -26,7 +26,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>This component enforces:
  * <ol>
  *   <li>Resilience4j sliding-window rate limiter per 60 seconds (default: 25 requests)</li>
- *   <li>Resilience4j circuit breaker tracking failures with automatic half-open transitions</li>
+ *   <li>Resilience4j circuit breaker tracking successes and failures with automatic half-open transitions</li>
  *   <li>Inter-request throttle delay (>= 350ms between calls to stay under 3 req/sec)</li>
  *   <li>Dynamic HTTP 429 backoff honoring upstream Retry-After headers</li>
  * </ol>
@@ -143,6 +143,16 @@ public class OpenF1RateLimiter {
             }
         }
         return true;
+    }
+
+    /**
+     * Records a successful outbound call to OpenF1 in the circuit breaker, allowing it to
+     * maintain accurate failure rate metrics and transition from HALF_OPEN to CLOSED.
+     *
+     * @param durationMs duration of the successful call in milliseconds
+     */
+    public void recordSuccess(long durationMs) {
+        resilienceCircuitBreaker.onSuccess(durationMs, TimeUnit.MILLISECONDS);
     }
 
     /**

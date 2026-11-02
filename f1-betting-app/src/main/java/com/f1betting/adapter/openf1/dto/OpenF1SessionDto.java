@@ -38,4 +38,7 @@ public class OpenF1SessionDto {
 
     @JsonProperty("date_end")
     private OffsetDateTime dateEnd;
+
+    @JsonProperty("is_cancelled")
+    private Boolean isCancelled;
 }

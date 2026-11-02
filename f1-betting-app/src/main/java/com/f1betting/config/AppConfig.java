@@ -4,7 +4,12 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestTemplate;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Application-level Spring configuration.
@@ -28,5 +33,27 @@ public class AppConfig {
         factory.setConnectTimeout(connectTimeoutMs);
         factory.setReadTimeout(readTimeoutMs);
         return new RestTemplate(factory);
+    }
+
+    /**
+     * Dedicated bounded thread pool for external driver validation calls,
+     * avoiding JVM ForkJoinPool.commonPool() starvation.
+     */
+    @Bean(destroyMethod = "shutdown")
+    public ExecutorService f1ValidationExecutor() {
+        return Executors.newFixedThreadPool(10, r -> {
+            Thread t = new Thread(r, "f1-validation-worker");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    /**
+     * Transaction template bean for explicit, programmatic transaction control
+     * that keeps external I/O strictly outside the database transaction boundaries.
+     */
+    @Bean
+    public TransactionTemplate transactionTemplate(PlatformTransactionManager transactionManager) {
+        return new TransactionTemplate(transactionManager);
     }
 }

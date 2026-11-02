@@ -17,11 +17,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
@@ -39,6 +41,9 @@ public class BettingService {
     private final EventOutcomeRepository eventOutcomeRepository;
     private final F1EventProvider f1EventProvider;
     private final OddsGenerator oddsGenerator;
+    private final SessionLockManager sessionLockManager;
+    private final TransactionTemplate transactionTemplate;
+    private final ExecutorService f1ValidationExecutor;
 
     @Value("${betting.driver-validation-timeout-seconds:8}")
     private long driverValidationTimeoutSeconds = 8;
@@ -46,63 +51,71 @@ public class BettingService {
     /**
      * Places a single bet for a user on a driver to win a specified F1 session.
      *
-     * <p>Business rules enforced:
+     * <p>Performance & Concurrency Design:
      * <ol>
-     *   <li>The event must not already have a recorded outcome (no post-race bets).</li>
-     *   <li>The driver must be registered in the specified session (external I/O, no DB lock held).</li>
-     *   <li>The user must exist (pessimistic lock acquired immediately before balance check).</li>
-     *   <li>The user must have sufficient balance to cover the stake (enforced via User domain debit).</li>
+     *   <li>External driver validation is performed OUTSIDE the database transaction to prevent Hikari connection starvation.</li>
+     *   <li>Uses a dedicated thread pool rather than ForkJoinPool.commonPool() with explicit cancellation on timeout.</li>
+     *   <li>Fine-grained lock on {@code sessionKey} prevents TOCTOU race conditions with concurrent outcome recordings.</li>
+     *   <li>Pessimistic write lock on the user ensures atomicity of balance debits.</li>
      * </ol>
-     *
-     * <p>The stake is deducted from the user's balance immediately upon placement.
-     * Odds are (re)generated at placement time and persisted with the bet.
      *
      * @param request the bet placement request
      * @return the created bet as a DTO
      */
-    @Transactional
     public BetDto placeBet(PlaceBetRequest request) {
-        // Rule 2: Cannot bet on an event that already has a recorded outcome (fast fail, no lock needed)
+        // Fast-fail check before external network I/O
         if (eventOutcomeRepository.existsBySessionKey(request.getSessionKey())) {
             throw new BettingException(
                     "Event with sessionKey '" + request.getSessionKey() +
                     "' already has a recorded outcome. No further bets are accepted.");
         }
 
-        // Rule 3: Driver must participate in the session (external network call executed BEFORE acquiring DB lock)
+        // Validate driver registration with external provider (OUTSIDE database transaction)
         validateDriverInSession(request.getSessionKey(), request.getDriverNumber());
 
-        // Rule 1: User must exist & acquire pessimistic write lock right before balance debit
-        User user = userRepository.findByIdForUpdate(request.getUserId())
-                .orElseThrow(() -> new ResourceNotFoundException(
-                        "User not found with id: " + request.getUserId()));
+        // Coordinate with OutcomeService via fine-grained lock to eliminate race conditions
+        return sessionLockManager.executeWithLock(request.getSessionKey(), () -> {
+            return transactionTemplate.execute(status -> {
+                // Atomic re-check inside transaction and lock
+                if (eventOutcomeRepository.existsBySessionKey(request.getSessionKey())) {
+                    throw new BettingException(
+                            "Event with sessionKey '" + request.getSessionKey() +
+                            "' already has a recorded outcome. No further bets are accepted.");
+                }
 
-        // Rule 4: Debit stake from user balance (enforces balance invariant, throws if insufficient)
-        user.debit(request.getStakeAmount());
-        userRepository.save(user);
+                // Acquire pessimistic write lock right before balance debit
+                User user = userRepository.findByIdForUpdate(request.getUserId())
+                        .orElseThrow(() -> new ResourceNotFoundException(
+                                "User not found with id: " + request.getUserId()));
 
-        // Generate odds and calculate potential payout
-        int odds = oddsGenerator.generateOdds();
-        BigDecimal potentialPayout = request.getStakeAmount().multiply(BigDecimal.valueOf(odds));
+                // Debit stake from user balance (enforces balance invariant, throws if insufficient)
+                user.debit(request.getStakeAmount());
+                userRepository.save(user);
 
-        // Persist the bet
-        Bet bet = Bet.builder()
-                .user(user)
-                .sessionKey(request.getSessionKey())
-                .driverNumber(request.getDriverNumber())
-                .stakeAmount(request.getStakeAmount())
-                .odds(odds)
-                .potentialPayout(potentialPayout)
-                .status(BetStatus.PENDING)
-                .placedAt(LocalDateTime.now())
-                .build();
+                // Generate odds and calculate potential payout
+                int odds = oddsGenerator.generateOdds();
+                BigDecimal potentialPayout = request.getStakeAmount().multiply(BigDecimal.valueOf(odds));
 
-        Bet saved = betRepository.save(bet);
-        log.info("Bet {} placed: user={} session={} driver={} stake={} odds={}",
-                saved.getId(), user.getUsername(), request.getSessionKey(),
-                request.getDriverNumber(), request.getStakeAmount(), odds);
+                // Persist the bet
+                Bet bet = Bet.builder()
+                        .user(user)
+                        .sessionKey(request.getSessionKey())
+                        .driverNumber(request.getDriverNumber())
+                        .stakeAmount(request.getStakeAmount())
+                        .odds(odds)
+                        .potentialPayout(potentialPayout)
+                        .status(BetStatus.PENDING)
+                        .placedAt(LocalDateTime.now())
+                        .build();
 
-        return toDto(saved);
+                Bet saved = betRepository.save(bet);
+                log.info("Bet {} placed: user={} session={} driver={} stake={} odds={}",
+                        saved.getId(), user.getUsername(), request.getSessionKey(),
+                        request.getDriverNumber(), request.getStakeAmount(), odds);
+
+                return toDto(saved);
+            });
+        });
     }
 
     @Transactional(readOnly = true)
@@ -126,17 +139,20 @@ public class BettingService {
     // -----------------------------------------------------------------------
 
     /**
-     * Verifies that the given driver number is present in the session by calling
-     * the F1 event provider within a bounded timeout. Throws {@link BettingException} if not found or timed out.
+     * Verifies that the given driver number is present in the session using a dedicated bounded
+     * thread pool with cancellation on timeout.
      */
     private void validateDriverInSession(String sessionKey, Integer driverNumber) {
+        Future<List<F1Driver>> future = f1ValidationExecutor.submit(
+                () -> f1EventProvider.getDriversForSession(sessionKey));
         List<F1Driver> drivers;
         try {
-            drivers = CompletableFuture.supplyAsync(() -> f1EventProvider.getDriversForSession(sessionKey))
-                    .get(driverValidationTimeoutSeconds, TimeUnit.SECONDS);
+            drivers = future.get(driverValidationTimeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
+            future.cancel(true);
             throw new BettingException("Timed out validating driver registration with F1 provider for session '" + sessionKey + "'. Please try again.");
         } catch (Exception e) {
+            future.cancel(true);
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             if (cause instanceof BettingException be) {
                 throw be;
